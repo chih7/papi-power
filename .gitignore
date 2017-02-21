@@ -26,5 +26,6 @@
 .dirstamp
 .done
 .libs
+.directory
 /bin/
 /obj/
