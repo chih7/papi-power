@@ -3,7 +3,7 @@ CFLAGS = -O2 -Wall
 LFLAGS = -lm -lpthread
 PAPI_INCLUDE = /home/chih/PMU/papi-5.5.1/src
 PAPI_LIBRARY = /home/chih/PMU/papi-5.5.1/src/libpapi.a
-FILE = rapl_power
+FILE = rp_t
 
 all:	$(FILE)
 
