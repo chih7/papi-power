@@ -3,9 +3,9 @@ CFLAGS = -O2 -Wall
 LFLAGS = -lm -lpthread
 PAPI_INCLUDE = /home/chih/PMU/papi-5.5.1/src
 PAPI_LIBRARY = /home/chih/PMU/papi-5.5.1/src/libpapi.a
-FILE = rp_t
+FILE = rp_t2
 
-all:	$(FILE)
+all:    clean $(FILE)
 
 $(FILE):	$(FILE).o
 	$(CC) $(LFLAGS) -o $(FILE) $(FILE).o $(PAPI_LIBRARY)
