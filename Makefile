@@ -1,14 +1,17 @@
 CC = g++
 CFLAGS = -O2 -Wall
-LFLAGS = -lm
+LFLAGS = -lm -lpthread
+PAPI_INCLUDE = /home/chih/PMU/papi-5.5.1/src
+PAPI_LIBRARY = /home/chih/PMU/papi-5.5.1/src/libpapi.a
+FILE = rapl_power
 
-all:	rapl
+all:	$(FILE)
 
-rapl:	rapl.o
-	$(CC) $(LFLAGS) -o rapl rapl.o
+$(FILE):	$(FILE).o
+	$(CC) $(LFLAGS) -o $(FILE) $(FILE).o $(PAPI_LIBRARY)
 
-rapl.o:	rapl.cpp
-	$(CC) $(CFLAGS) -c rapl.cpp
+$(FILE).o:	$(FILE).cpp
+	$(CC) $(CFLAGS) -I$(PAPI_INCLUDE) -c $(FILE).cpp
 
 clean:
-	rm -f *.o *~ rapl
+	rm -f *.o *~ $(FILE)

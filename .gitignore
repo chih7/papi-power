@@ -1,31 +1,53 @@
-*.bc
-*.cmake
-*.dSYM
-*.done
-*.final
-*.gcda
-*.gcno
-*.i
+# Prerequisites
+*.d
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
 *.la
 *.lo
-*.log
-*.mem
-*.nexe
-*.o
-*.plist
-*.s
-*.scan
-*.sdf
-*.status
-*.tar.*
-*.wasm
-*.wast
-*~
-.DS_Store
-.deps
-.dirstamp
-.done
-.libs
-#.directory
-/bin/
-/obj/
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+rp_t
+rp-t2
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Kernel Module Compile Results
+*.mod*
+*.cmd
+modules.order
+Module.symvers
+Mkfile.old
+dkms.conf
