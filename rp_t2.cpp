@@ -6,10 +6,6 @@
 #include <stdint.h>
 #include <string.h>
 
-#include <algorithm>
-#include <numeric>
-#include <vector>
-
 #include "papi.h"
 #include <stdlib.h>
 #include <stdio.h>
@@ -19,8 +15,24 @@
 #include <sys/time.h>
 #include <ctype.h>
 #include <errno.h>
-#define EVENT_NUM       3
 
+#define HARDWARE_COUNTERS_NUM   11
+#define EVENTS_NUM              8
+
+int sampleInterval_msec = 1000;
+int sampleCount = 10;
+
+static int select_preset_events[EVENTS_NUM] = {PAPI_L1_DCM, PAPI_L1_ICM, PAPI_L2_DCM,
+                                               PAPI_L2_ICM, PAPI_L1_TCM, PAPI_L2_TCM,
+                                               PAPI_L3_TCM, PAPI_L3_LDM
+                                              };
+
+static char *select_preset_events_name[EVENTS_NUM] = {"PAPI_L1_DCM", "PAPI_L1_ICM", "PAPI_L2_DCM",
+                                                      "PAPI_L2_ICM", "PAPI_L1_TCM", "PAPI_L2_TCM",
+                                                      "PAPI_L3_TCM", "PAPI_L3_LDM"
+                                                     };
+
+//char *select_native_events[EVENTS_NUM];
 
 // The value of argv[0] passed to main(). Used in error messages.
 static const char* gArgv0;
@@ -28,20 +40,37 @@ static const char* gArgv0;
 // A special value that represents an estimate from an unsupported RAPL domain.
 static const double kUnsupported_j = -1.0;
 
-//----------------------------------------------------------------------------
-
+FILE *fp;
+struct timeval tv;//前后两次采样时间值
+struct tm* pt;
+time_t itime;
 
 static void
 Abort(const char* aFormat, ...)
 {
-  va_list vargs;
-  va_start(vargs, aFormat);
-  fprintf(stderr, "%s: ", gArgv0);
-  vfprintf(stderr, aFormat, vargs);
-  fprintf(stderr, "\n");
-  va_end(vargs);
+    va_list vargs;
+    va_start(vargs, aFormat);
+    fprintf(stderr, "%s: ", gArgv0);
+    vfprintf(stderr, aFormat, vargs);
+    fprintf(stderr, "\n");
+    va_end(vargs);
 
-  exit(1);
+    exit(1);
+}
+
+// Print to stdout and flush it, so that the output appears immediately even if
+// being redirected through |tee| or anything like that.
+static void
+PrintAndFlush(const char* aFormat, ...)
+{
+    va_list vargs;
+    va_start(vargs, aFormat);
+    vfprintf(fp, aFormat, vargs);
+    vfprintf(stdout, aFormat, vargs);
+    va_end(vargs);
+
+    fflush(fp);
+    fflush(stdout);
 }
 
 //---------------------------------------------------------------------------
@@ -56,7 +85,7 @@ static int
 perf_event_open(struct perf_event_attr* aAttr, pid_t aPid, int aCpu,
                 int aGroupFd, unsigned long aFlags)
 {
-  return syscall(__NR_perf_event_open, aAttr, aPid, aCpu, aGroupFd, aFlags);
+    return syscall(__NR_perf_event_open, aAttr, aPid, aCpu, aGroupFd, aFlags);
 }
 
 // Returns false if the file cannot be opened.
@@ -65,200 +94,166 @@ static bool
 ReadValueFromPowerFile(const char* aStr1, const char* aStr2, const char* aStr3,
                        const char* aScanfString, T* aOut)
 {
-  // The filenames going into this buffer are under our control and the longest
-  // one is "/sys/bus/event_source/devices/power/events/energy-cores.scale".
-  // So 256 chars is plenty.
-  char filename[256];
+    // The filenames going into this buffer are under our control and the longest
+    // one is "/sys/bus/event_source/devices/power/events/energy-cores.scale".
+    // So 256 chars is plenty.
+    char filename[256];
 
-  sprintf(filename, "/sys/bus/event_source/devices/power/%s%s%s",
-          aStr1, aStr2, aStr3);
-  FILE* fp = fopen(filename, "r");
-  if (!fp) {
-    return false;
-  }
-  if (fscanf(fp, aScanfString, aOut) != 1) {
-    Abort("fscanf() failed");
-  }
-  fclose(fp);
+    sprintf(filename, "/sys/bus/event_source/devices/power/%s%s%s",
+            aStr1, aStr2, aStr3);
+    FILE* sysfp = fopen(filename, "r");
+    if (!sysfp) {
+        return false;
+    }
+    if (fscanf(sysfp, aScanfString, aOut) != 1) {
+        Abort("fscanf() failed");
+    }
+    fclose(sysfp);
 
-  return true;
+    return true;
 }
 
-
-//---------------------------------------------------------------------------------------------------------------------
 // This class encapsulates the reading of a single RAPL domain.
 class Domain
 {
-  bool mIsSupported;      // Is the domain supported by the processor?
+    bool mIsSupported;      // Is the domain supported by the processor?
 
-  // These three are only set if |mIsSupported| is true.
-  double mJoulesPerTick;  // How many Joules each tick of the MSR represents.
-  int mFd;                // The fd through which the MSR is read.
-  double mPrevTicks;      // The previous sample's MSR value.
+    // These three are only set if |mIsSupported| is true.
+    double mJoulesPerTick;  // How many Joules each tick of the MSR represents.
+    int mFd;                // The fd through which the MSR is read.
+    double mPrevTicks;      // The previous sample's MSR value.
 
 public:
-  enum IsOptional { Optional, NonOptional };
+    enum IsOptional { Optional, NonOptional };
 
-  Domain(const char* aName, uint32_t aType, IsOptional aOptional = NonOptional)
-  {
-    uint64_t config;
-    if (!ReadValueFromPowerFile("events/energy-", aName, "", "event=%llx",
-         &config)) {
-      // Failure is allowed for optional domains.
-      if (aOptional == NonOptional) {
-        Abort("failed to open file for non-optional domain '%s'\n"
-              "- Is your kernel version 3.14 or later, as required? "
-              "Run |uname -r| to see.", aName);
-      }
-      mIsSupported = false;
-      return;
+    Domain(const char* aName, uint32_t aType, IsOptional aOptional = NonOptional)
+    {
+        uint64_t config;
+        if (!ReadValueFromPowerFile("events/energy-", aName, "", "event=%llx",
+                                    &config)) {
+            // Failure is allowed for optional domains.
+            if (aOptional == NonOptional) {
+                Abort("failed to open file for non-optional domain '%s'\n"
+                      "- Is your kernel version 3.14 or later, as required? "
+                      "Run |uname -r| to see.", aName);
+            }
+            mIsSupported = false;
+            return;
+        }
+
+        mIsSupported = true;
+
+        ReadValueFromPowerFile("events/energy-", aName, ".scale", "%lf",
+                               &mJoulesPerTick);
+
+        // The unit should be "Joules", so 128 chars should be plenty.
+        char unit[128];
+        ReadValueFromPowerFile("events/energy-", aName, ".unit", "%127s", unit);
+        if (strcmp(unit, "Joules") != 0) {
+            Abort("unexpected unit '%s' in .unit file", unit);
+        }
+
+        struct perf_event_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.type = aType;
+        attr.size = uint32_t(sizeof(attr));
+        attr.config = config;
+
+        // Measure all processes/threads. The specified CPU doesn't matter.
+        // need to special a pid?
+        mFd = perf_event_open(&attr, /* pid = */ -1, /* cpu = */ 0,
+                              /* group_fd = */ -1, /* flags = */ 0);
+        if (mFd < 0) {
+            Abort("perf_event_open() failed\n"
+                  "- Did you run as root (e.g. with |sudo|) or set\n"
+                  "  /proc/sys/kernel/perf_event_paranoid to 0, as required?");
+        }
+
+        mPrevTicks = 0;
     }
 
-    mIsSupported = true;
-
-    ReadValueFromPowerFile("events/energy-", aName, ".scale", "%lf",
-                           &mJoulesPerTick);
-
-    // The unit should be "Joules", so 128 chars should be plenty.
-    char unit[128];
-    ReadValueFromPowerFile("events/energy-", aName, ".unit", "%127s", unit);
-    if (strcmp(unit, "Joules") != 0) {
-      Abort("unexpected unit '%s' in .unit file", unit);
+    ~Domain()
+    {
+        if (mIsSupported) {
+            close(mFd);
+        }
     }
 
-    struct perf_event_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.type = aType;
-    attr.size = uint32_t(sizeof(attr));
-    attr.config = config;
+    double EnergyEstimate()
+    {
+        if (!mIsSupported) {
+            return kUnsupported_j;
+        }
 
-    // Measure all processes/threads. The specified CPU doesn't matter.
-    mFd = perf_event_open(&attr, /* pid = */ -1, /* cpu = */ 0,
-                          /* group_fd = */ -1, /* flags = */ 0);
-    if (mFd < 0) {
-      Abort("perf_event_open() failed\n"
-            "- Did you run as root (e.g. with |sudo|) or set\n"
-            "  /proc/sys/kernel/perf_event_paranoid to 0, as required?");
+        uint64_t thisTicks;
+        if (read(mFd, &thisTicks, sizeof(uint64_t)) != sizeof(uint64_t)) {
+            Abort("read() failed");
+        }
+
+        uint64_t ticks = thisTicks - mPrevTicks;
+        mPrevTicks = thisTicks;
+        double joules = ticks * mJoulesPerTick;
+        return joules;
     }
-
-    mPrevTicks = 0;
-  }
-
-  ~Domain()
-  {
-    if (mIsSupported) {
-      close(mFd);
-    }
-  }
-
-  double EnergyEstimate()
-  {
-    if (!mIsSupported) {
-      return kUnsupported_j;
-    }
-
-    uint64_t thisTicks;
-    if (read(mFd, &thisTicks, sizeof(uint64_t)) != sizeof(uint64_t)) {
-      Abort("read() failed");
-    }
-
-    uint64_t ticks = thisTicks - mPrevTicks;
-    mPrevTicks = thisTicks;
-    double joules = ticks * mJoulesPerTick;
-    return joules;
-  }
-
-//wzx-----
-
-  double readEnergy()
-  {
-	if(!mIsSupported){
-		return -1.0;//KUnsupported_j;
-	}
-	uint64_t thisTicks;
-	if(read(mFd,&thisTicks,sizeof(uint64_t)) != sizeof(uint64_t))
-	{
-		Abort("read() failed");
-	}
-	return thisTicks* mJoulesPerTick;
-  }
-
-//-------
-
-
 };
 
 class RAPL
 {
-  Domain* mPkg;
-  Domain* mCores;
-  Domain* mGpu;
-  Domain* mRam;
+    // PKG: The entire package.
+    Domain* mPkg;
+    // PP0
+    Domain* mCores;
+    // client only PP1
+    Domain* mGpu;
+    Domain* mRam;
 
 public:
-  RAPL()
-  {
-    uint32_t type;
-    ReadValueFromPowerFile("type", "", "", "%u", &type);
+    RAPL()
+    {
+        uint32_t type;
+        ReadValueFromPowerFile("type", "", "", "%u", &type);
 
-    mPkg   = new Domain("pkg",   type);
-    mCores = new Domain("cores", type);
-    mGpu   = new Domain("gpu",   type, Domain::Optional);
-    mRam   = new Domain("ram",   type, Domain::Optional);
-    if (!mPkg || !mCores || !mGpu || !mRam) {
-      Abort("new Domain() failed");
+        mPkg   = new Domain("pkg",   type);
+        mCores = new Domain("cores", type);
+        mGpu   = new Domain("gpu",   type, Domain::Optional);
+        mRam   = new Domain("ram",   type, Domain::Optional);
+        if (!mPkg || !mCores || !mGpu || !mRam) {
+            Abort("new Domain() failed");
+        }
     }
-  }
 
-  ~RAPL()
-  {
-    delete mPkg;
-    delete mCores;
-    delete mGpu;
-    delete mRam;
-  }
+    ~RAPL()
+    {
+        delete mPkg;
+        delete mCores;
+        delete mGpu;
+        delete mRam;
+    }
 
-  void EnergyEstimates(double& aPkg_J, double& aCores_J, double& aGpu_J,
-                       double& aRam_J)
-  {
-    aPkg_J   = mPkg->EnergyEstimate();
-    aCores_J = mCores->EnergyEstimate();
-    aGpu_J   = mGpu->EnergyEstimate();
-    aRam_J   = mRam->EnergyEstimate();
-  }
-//wzx----------------------------------------
-
-	void TotalEnergy(double& aPkg_J,double& aCores_J, double& aGpu_J, double& aRam_J)
-	{
-		aPkg_J = mPkg->readEnergy();
-		aCores_J = mCores->readEnergy();
-		aGpu_J = mGpu->readEnergy();
-		aRam_J = mRam->readEnergy();
-	}
-//--------------------------------------------------
+    void EnergyEstimates(double& aPkg_J, double& aCores_J, double& aGpu_J,
+                         double& aRam_J)
+    {
+        aPkg_J   = mPkg->EnergyEstimate();
+        aCores_J = mCores->EnergyEstimate();
+        aGpu_J   = mGpu->EnergyEstimate();
+        aRam_J   = mRam->EnergyEstimate();
+    }
 };
 
 
-//--------------------------------------------------------------------------------------------- 
-
-
 // The sample interval, measured in seconds.
-static double gSampleInterval_sec;
+static double gSampleInterval_sec = double(sampleInterval_msec) / 1000;
 
 // The platform-specific RAPL-reading machinery.
 static RAPL* gRapl;
-
-// All the sampled "total" values, in Watts.
-static std::vector<double> gTotals_W;
 
 // Power = Energy / Time, where power is measured in Watts, Energy is measured
 // in Joules, and Time is measured in seconds.
 static double
 JoulesToWatts(double aJoules)
 {
-  return aJoules / gSampleInterval_sec;
+    return aJoules / gSampleInterval_sec;
 }
-
 
 // "Normalize" here means convert kUnsupported_j to zero so it can be used in
 // additive expressions. All printed values are 5 or maybe 6 chars (though 6
@@ -266,484 +261,226 @@ JoulesToWatts(double aJoules)
 static void
 NormalizeAndPrintAsWatts(char* aBuf, double& aValue_J)
 {
-  if (aValue_J == kUnsupported_j) {
-    aValue_J = 0;
-    sprintf(aBuf, "%s", " n/a ");
-  } else {
-    sprintf(aBuf, "%5.2f", JoulesToWatts(aValue_J));
-  }
-}
-//------------------------------------------------------------------------------------------------------------------------------
-void *thread_utility(void *arg);//单线程，用于获取三种组件在采样周期内的利用率
-
-int main() {
-
-
-
-    char string[] ="sync && echo 3 > /proc/sys/vm/drop_caches && sleep 2 && echo 1 > /proc/sys/vm/drop_caches && echo 2 > /proc/sys/vm/drop_caches";
-    system(string); //清除系统缓存
-
-    int result;
-    pthread_t a_thread;//用于获取组件利用率的单线程
-
-    /* Initialize the PAPI library */
-    if (PAPI_library_init(PAPI_VER_CURRENT) != PAPI_VER_CURRENT)
-                exit(-1);
-    
-
- 	//create a thread used to deal with the performance sample stuff	
-	result = pthread_create(&a_thread, NULL, thread_utility, NULL);//create a thread, return int type
-    
-	if(result != 0)
-	{
-	  perror("thread creation failed");
-	  exit(1);
-	}
-	
-
-
-    /* Do some computation here */
-        int a = 0;
-        int b = 1;
-        for( int k = 0;k<1000000;k++)
-        {
-             for(int c =0;c < 1000;c++)
-            {
-                 a = rand()%100;
-                  a = a*34.6;
-                  }
-            b = b+3;
-
-         }
-
-
-	//sleep(20);
-        result = pthread_cancel(a_thread);
-    	if(result != 0)
-    	{
-         	perror("Thread cancellation failed!\n");
-         	exit(EXIT_FAILURE);
-    	}
-
-//    printf("waiting for thread to finish......\n");
-       void *joinresult;
-       result = pthread_join(a_thread,&joinresult);//等待回收其他线程，该函数u 会一直阻塞，直到被收回的线程结束为止
-       if(result != 0)
-       {
-          exit(EXIT_FAILURE);
-       }    
-  
-       exit(EXIT_SUCCESS);
+    if (aValue_J == kUnsupported_j) {
+        aValue_J = 0;
+        sprintf(aBuf, "%s", " n/a ");
+    } else {
+        sprintf(aBuf, "%5.2f", JoulesToWatts(aValue_J));
+    }
 }
 
-
-
-void *thread_utility(void *arg)
+void
+*thread_utility(void *arg)
 {
 
-//----------------------------------
+    int retval, EventSet = PAPI_NULL;
+    unsigned int native = 0x0;
 
-	static int sampleNumer = 1;
-	double pkg_J, cores_J, gpu_J, ram_J;
-	double pwr = 0.0;
-	double pwr1 ;
-	double pwr2 ;
-
-  // Initialize the platform-specific RAPL reading machinery.
-  	gRapl = new RAPL();
-
-
-//--------------------------------------
-   int res;
-   int EventSet;
-   double interval;// 两次采样时间间隔
-  // char msg[8];//接收服务端的消息
-   int i=0;
-
-   FILE *fp;
-   struct timeval tv1;//前后两次采样时间值
-   struct timeval tv2;
-   struct tm* pt1;
-   struct tm* pt2;
-   time_t itime;
-   int cur_millisec;//精确到毫秒级
-
-    long_long values[EVENT_NUM] = {0};
-    long_long values1[EVENT_NUM] = {0};
-    long_long values2[EVENT_NUM] = {0};
-    long_long values3[EVENT_NUM] = {0};
-//----------------------------------------
-
-	long_long evt = 0;
-	long_long evt1 = 0;
-	long_long evt2 = 0;
-	long_long evt3 = 0;
-	long_long evt4 = 0;
-	long_long evt5 = 0;
-	long_long evt6 = 0;
-	long_long evt7 = 0;
-	long_long evt8 = 0;
-	long_long evt9 = 0;
-
-//-----------------------------------------
- 
-
-
- //  float freq[4];
-  // float curfreq[4];
-   //int cpu = 0;
- //  float power;//功率估计值
-   
-   pthread_t child_thread;//子线程的id号
-   int result,core;
-   //cpu_set_t mask;
- 
- 
-   res = pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-                                                           
-   if(res != 0)
-   {
-      perror("Thread pthread_setcancelstate failed!");
-      exit(EXIT_FAILURE);
-   }
-
-   //PTHREAD_CANCEL_DEFERRED--接收到取消请求后，一直等待，直到线程执行一些函数
-   res = pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
-                                                            
-                                                             
-   if(res != 0)
-   {
-      perror("Thread pthread_setcanceltype failed!");
-      exit(EXIT_FAILURE);
-   }
-   
-   if((fp = fopen("util-power.csv", "ab")) == NULL) // util-power.csv is used to store the performance statistics at certain time
-   {
-       perror("file open failed!");
-       exit(EXIT_FAILURE);
-   }
-
-//   fprintf(fp,"timestamp,e0,e1,core2,core3,util0,util1,util2,util3,cpu,disk,predict,power\n");
-   fprintf(fp,"timestamp,PAPI_L1_DCM,PAPI_L1_ICM,PAPI_L2_DCM,PAPI_L2_ICM,PAPI_L3_LDM,PAPI_TLB_DM,PAPI_TLB_IM,PAPI_PRF_DM,PAPI_STL_CCY,PAPI_BR_INS,power\n");
-
-   //printf("thread function is running......\n");   
-/*
-   gettimeofday (&tv1, NULL);
-   itime = time(NULL);//从1970年－1-1零点零分到当前系统所偏移的秒数
-   pt1 = localtime(&itime);//将从1970－1-1零点零分到当前时间系统所偏移的秒数时间转换为本地时间
-   cur_millisec = tv1.tv_usec/1000;
-   
-*/
-//---------------------------------------------------
-
-	gRapl->TotalEnergy(pkg_J,cores_J,gpu_J,ram_J);
-  	// We should have pkg and cores estimates, but might not have gpu and ram
-  	// estimates.
-
-  	assert(pkg_J   != kUnsupported_j);    //assert计算表达式，0为假，并输出
-  	assert(cores_J != kUnsupported_j);
-
-
- 	// This needs to be big enough to print watt values to two decimal places. 16
-  	// should be plenty.
-  	//static const size_t kNumStrLen = 16;
-
-  	//static char pkgStr[kNumStrLen], coresStr[kNumStrLen], gpuStr[kNumStrLen],
-          //    ramStr[kNumStrLen];
-
-  	// Core and GPU power are a subset of the package power.
-  	assert(pkg_J >= cores_J + gpu_J);
-
-  	// Compute "other" (i.e. rest of the package) and "total" only after the
-  	// other values have been normalized.
-
-  	//char otherStr[kNumStrLen];
-  	double other_J = 0.0;
-	other_J = pkg_J - cores_J - gpu_J;
-  	//NormalizeAndPrintAsWatts(otherStr, other_J);
-
-  	//char totalStr[kNumStrLen];
-  	double total_J = 0.0;
-	total_J = pkg_J + ram_J;
-	//printf("%5.2f",total_J);
-  	//NormalizeAndPrintAsWatts(totalStr, total_J);
-	//char *pwr_first = (char*)malloc(strlen(totalStr));
-	//strcpy(pwr_first,totalStr); 
-
-//------------------------------------------------------
-
-   int fd[256];//文件描述符
-   
     /* Initialize the PAPI library */
-    if (PAPI_library_init(PAPI_VER_CURRENT) != PAPI_VER_CURRENT)
-                exit(-1);
-      // exit(-1);
+    if((PAPI_library_init(PAPI_VER_CURRENT)) != PAPI_VER_CURRENT ) {
+        printf("PAPI failed to init.\n");
+        exit(1);
+    }
 
     /* Create an EventSet */
     EventSet = PAPI_NULL;
-    if (PAPI_create_eventset(&EventSet) != PAPI_OK)
-        exit(-1);
-
-    /* Add an event about Total Instructions Executed (PAPI_TOT_INS) to EventSet */
-/*
-    if (PAPI_add_event(EventSet, PAPI_L1_TCM) != PAPI_OK)
-        exit(-1);
-    if (PAPI_add_event(EventSet, PAPI_L2_TCM) != PAPI_OK)
-        exit(-1);
-    if (PAPI_add_event(EventSet, PAPI_L3_TCM ) != PAPI_OK)
-        exit(-1);
-
-  
-   //第一次获取系统的信息 应当具备什么条件?   
-    /* Start counting events */
-/*
-   if (PAPI_start(EventSet) != PAPI_OK)
-        exit(-1);
-
-    /* Read counters before workload running*/
-/*
-    if (PAPI_read(EventSet, values1) != PAPI_OK)
-        exit(-1);
-
-*/
-//---------------------------------------------------------------------
-   while(1)
-   {
-
-          gettimeofday (&tv1, NULL);
-          itime = time(NULL);//从1970年－1-1零点零分到当前系统所偏移的秒数
-          pt1 = localtime(&itime);//将从1970－1-1零点零分到当前时间系统所偏移的秒数时间转换为本地时间
-          cur_millisec = tv1.tv_usec/1000;
-
-
-
-          if(i==0)
-	      {                   /**   "%m.nf":输出浮点数，m为宽度，n为小数点右边数位   **/
-	      	fprintf(fp,"%d:%d:%d.%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%5.2f\n",pt1->tm_hour,pt1->tm_min,pt1->tm_sec,cur_millisec,evt,evt1,evt2,evt3,evt4,evt5,evt6,evt7,evt8,evt9,pwr); //put the results into file
-              	i++;
-              }
-              
-          if(i==1)
-               i++;
-          else
-	       fprintf(fp,"%d:%d:%d.%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%5.2f\n",pt1->tm_hour,pt1->tm_min,pt1->tm_sec,cur_millisec,evt,evt1,evt2,evt3,evt4,evt5,evt6,evt7,evt8,evt9,pwr); //put the results into file
-		
-				
-       /*  sleep(1);*/
-
-//---------------------------------------------------
-    /* Add an event about Total Instructions Executed (PAPI_TOT_INS) to EventSet */
-    	if (PAPI_add_event(EventSet, PAPI_L1_DCM) != PAPI_OK)
-        	exit(-1);
-    	if (PAPI_add_event(EventSet, PAPI_L1_ICM) != PAPI_OK)
-        	exit(-1);
-    	if (PAPI_add_event(EventSet, PAPI_L2_DCM ) != PAPI_OK)
-        	exit(-1);
-
-    /* Start counting events */
-
-   	if (PAPI_start(EventSet) != PAPI_OK)
-        	exit(-1);
-
-    /* Read counters before workload running*/
-
-    	if (PAPI_read(EventSet, values1) != PAPI_OK)
-        	exit(-1);
-
-    	usleep(250000);
-
-           /* Read counters */
-        if (PAPI_read(EventSet, values2) != PAPI_OK)
-                exit(-1);
-	evt = values2[0]-values1[0];
-	evt1 = values2[1]-values1[1];
-	evt2 = values2[2]-values1[2];
-
-    /* Stop counting events */
-    /* Stop counting events */
-    	if (PAPI_stop(EventSet, values3) != PAPI_OK)
-        	exit(-1);
-
-    /* Clean up EventSet */
-    	if (PAPI_cleanup_eventset(EventSet) != PAPI_OK)
-        	exit(-1);
-
-//------------
-    /* Add an event about Total Instructions Executed (PAPI_TOT_INS) to EventSet */
-    	if (PAPI_add_event(EventSet, PAPI_L2_ICM) != PAPI_OK)
-        	exit(-1);
-    	if (PAPI_add_event(EventSet, PAPI_L3_LDM) != PAPI_OK)
-        	exit(-1);
-    	if (PAPI_add_event(EventSet, PAPI_TLB_DM ) != PAPI_OK)
-        	exit(-1);
-
-    /* Start counting events */
-
-   	if (PAPI_start(EventSet) != PAPI_OK)
-        	exit(-1);
-
-    /* Read counters before workload running*/
-
-    	if (PAPI_read(EventSet, values1) != PAPI_OK)
-        	exit(-1);
-
-    	usleep(250000);
-
-           /* Read counters */
-        if (PAPI_read(EventSet, values2) != PAPI_OK)
-                exit(-1);
-	evt3 = values2[0]-values1[0];
-	evt4 = values2[1]-values1[1];
-	evt5 = values2[2]-values1[2];
-
-    /* Stop counting events */
-    /* Stop counting events */
-    	if (PAPI_stop(EventSet, values3) != PAPI_OK)
-        	exit(-1);
-
-    /* Clean up EventSet */
-    	if (PAPI_cleanup_eventset(EventSet) != PAPI_OK)
-        	exit(-1);
-//--------------------------------------
-    /* Add an event about Total Instructions Executed (PAPI_TOT_INS) to EventSet */
-    	if (PAPI_add_event(EventSet, PAPI_TLB_IM) != PAPI_OK)
-        	exit(-1);
-    	if (PAPI_add_event(EventSet, PAPI_PRF_DM) != PAPI_OK)
-        	exit(-1);
-    	if (PAPI_add_event(EventSet, PAPI_STL_CCY ) != PAPI_OK)
-        	exit(-1);
-
-    /* Start counting events */
-
-   	if (PAPI_start(EventSet) != PAPI_OK)
-        	exit(-1);
-
-    /* Read counters before workload running*/
-
-    	if (PAPI_read(EventSet, values1) != PAPI_OK)
-        	exit(-1);
-
-    	usleep(250000);
-
-           /* Read counters */
-        if (PAPI_read(EventSet, values2) != PAPI_OK)
-                exit(-1);
-	evt6 = values2[0]-values1[0];
-	evt7 = values2[1]-values1[1];
-	evt8 = values2[2]-values1[2];
-
-    /* Stop counting events */
-    /* Stop counting events */
-    	if (PAPI_stop(EventSet, values3) != PAPI_OK)
-        	exit(-1);
-
-    /* Clean up EventSet */
-    	if (PAPI_cleanup_eventset(EventSet) != PAPI_OK)
-        	exit(-1);
-//-------------
-    /* Add an event about Total Instructions Executed (PAPI_TOT_INS) to EventSet */
-    	if (PAPI_add_event(EventSet, PAPI_BR_INS) != PAPI_OK)
-        	exit(-1);
-
-    /* Start counting events */
-
-   	if (PAPI_start(EventSet) != PAPI_OK)
-        	exit(-1);
-
-    /* Read counters before workload running*/
-
-    	if (PAPI_read(EventSet, values1) != PAPI_OK)
-        	exit(-1);
-
-    	usleep(250000);
-
-           /* Read counters */
-        if (PAPI_read(EventSet, values2) != PAPI_OK)
-                exit(-1);
-	evt9 = values2[0]-values1[0];
-
-
-    /* Stop counting events */
-    /* Stop counting events */
-    	if (PAPI_stop(EventSet, values3) != PAPI_OK)
-        	exit(-1);
-
-    /* Clean up EventSet */
-    	if (PAPI_cleanup_eventset(EventSet) != PAPI_OK)
-        	exit(-1);
-
-
-
-
-
-//-----------------------------------------------------------	       
-           /* Read counters */
-/*         if (PAPI_read(EventSet, values2) != PAPI_OK)
-                exit(-1);
-
-        values[0]=values2[0]-values1[0];
-        values[1]=values2[1]-values1[1];
-        values[2]=values2[2]-values1[2];
-
-        values1[0]=values2[0];
-        values1[1]=values2[1];
-        values1[2]=values2[2];*/
-            i++;
-//----------------------------------------------------------------------------
-	
-	pwr1 = total_J;
-	//printf("%5.2f\n",total_J);
-
-	gRapl->TotalEnergy(pkg_J,cores_J,gpu_J,ram_J);
-  	// We should have pkg and cores estimates, but might not have gpu and ram
-  	// estimates.
-  	assert(pkg_J   != kUnsupported_j);    //assert计算表达式，0为假，并输出
-  	assert(cores_J != kUnsupported_j);
-
-
- 	// This needs to be big enough to print watt values to two decimal places. 16
-  	// should be plenty.
-  	//static const size_t kNumStrLen = 16;
-
-  	//static char pkgStr[kNumStrLen], coresStr[kNumStrLen], gpuStr[kNumStrLen],
-      //        ramStr[kNumStrLen];
-
-	
-
-  	// Core and GPU power are a subset of the package power.
-  	assert(pkg_J >= cores_J + gpu_J);
-
-  	// Compute "other" (i.e. rest of the package) and "total" only after the
-  	// other values have been normalized.
-  	other_J = pkg_J - cores_J - gpu_J;
-
-        total_J = pkg_J + ram_J;
-  	pwr2 = total_J;
-
-	pwr = (double)(pwr2-pwr1);
-	//printf("%5.2f\n",pwr);
-	//pwr1 = pwr2;        
-//---------------------------------------------------------------------------
+    if (PAPI_create_eventset(&EventSet) != PAPI_OK) {
+        printf("PAPI failed to create the event set.\n");
+        exit(1);
+    }
+    //if (PAPI_set_multiplex(EventSet) != PAPI_OK){
+    //	printf("PAPI multiplexing is not supported\n");
+    //}
+    //=========================================================
+    //=========================================================
+    for(int i = 0; i < EVENTS_NUM; i++) {
+        if(PAPI_query_event(select_preset_events[i]) == PAPI_OK) {
+            PAPI_add_event(EventSet, select_preset_events[i]);
         }
-     
+    }
 
-    fclose(fp);
-    /* Stop counting events */
-    /* Stop counting events */
-/*    if (PAPI_stop(EventSet, values3) != PAPI_OK)
-        exit(-1);
+    if (PAPI_start(EventSet) != PAPI_OK) {
+        printf("PAPI_start error! \n");
+        exit(1);
+    }
 
-    /* Clean up EventSet */
- /*   if (PAPI_cleanup_eventset(EventSet) != PAPI_OK)
-        exit(-1);
-*/
-    /* Destroy the EventSet */
-    if (PAPI_destroy_eventset(&EventSet) != PAPI_OK)
-        exit(-1);
+    // The RAPL MSRs update every ~1 ms, but the measurement period isn't exactly
+    // 1 ms, which means the sample periods are not exact. "Power Measurement
+    // Techniques on Standard Compute Nodes: A Quantitative Comparison" by
+    // Hackenberg et al. suggests the following.
+    //
+    //   "RAPL provides energy (and not power) consumption data without
+    //   timestamps associated to each counter update. This makes sampling rates
+    //   above 20 Samples/s unfeasible if the systematic error should be below
+    //   5%... Constantly polling the RAPL registers will both occupy a processor
+    //   core and distort the measurement itself."
+    //
+    // So warn about this case.
+    //sampleInterval_msec = sampleInterval_msec/2;
+    if (sampleInterval_msec < 50) {
+        fprintf(stderr,
+                "\nWARNING: sample intervals < 50 ms are likely to produce "
+                "inaccurate estimates\n\n");
+    }
 
+    // Initialize the platform-specific RAPL reading machinery.
+    gRapl = new RAPL();
+
+    int res;
+
+    res = pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    if(res != 0) {
+        perror("Thread pthread_setcancelstate failed!");
+        exit(EXIT_FAILURE);
+    }
+
+    //PTHREAD_CANCEL_DEFERRED--接收到取消请求后，一直等待，直到线程执行一些函数
+    res = pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+    if(res != 0) {
+        perror("Thread pthread_setcanceltype failed!");
+        exit(EXIT_FAILURE);
+    }
+
+    PrintAndFlush("timestamp,");
+    for (int i=0; i < EVENTS_NUM; i++) {
+        PrintAndFlush("%s,",select_preset_events_name[i]);
+    }
+    PrintAndFlush("pp0-power,pp1-power,pkg-power,ram-power\n");
+
+    int accu = 1;
+    while(true) {
+
+        if (PAPI_reset(EventSet) != PAPI_OK) {
+            printf("PAPI_reset error! \n");
+            exit(1);
+        }
+
+        gettimeofday (&tv, NULL);
+        itime = time(NULL);//从1970年－1-1零点零分到当前系统所偏移的秒数
+        pt = localtime(&itime);//将从1970－1-1零点零分到当前时间系统所偏移的秒数时间转换为本地时间
+        int cur_millisec = tv.tv_usec/1000;
+
+
+        long_long values[EVENTS_NUM] = {0};
+        /* Read counters */
+        if (PAPI_read(EventSet, values) != PAPI_OK) {
+            printf("PAPI_read error! \n");
+            exit(1);
+        }
+
+        double pkg_J, cores_J, gpu_J, ram_J;
+        gRapl->EnergyEstimates(pkg_J, cores_J, gpu_J, ram_J);
+
+        // We should have pkg and cores estimates, but might not have gpu and ram
+        // estimates.
+        assert(pkg_J   != kUnsupported_j);
+        assert(cores_J != kUnsupported_j);
+
+        // This needs to be big enough to print watt values to two decimal places. 16
+        // should be plenty.
+        static const size_t kNumStrLen = 16;
+
+        static char pkgStr[kNumStrLen], coresStr[kNumStrLen], gpuStr[kNumStrLen],
+               ramStr[kNumStrLen];
+        NormalizeAndPrintAsWatts(pkgStr,   pkg_J);
+        NormalizeAndPrintAsWatts(coresStr, cores_J);
+        NormalizeAndPrintAsWatts(gpuStr,   gpu_J);
+        NormalizeAndPrintAsWatts(ramStr,   ram_J);
+
+        // Core and GPU power are a subset of the package power.
+        assert(pkg_J >= cores_J + gpu_J);
+
+        // Compute "other" (i.e. rest of the package) and "total" only after the
+        // other values have been normalized.
+
+        char otherStr[kNumStrLen];
+        double other_J = pkg_J - cores_J - gpu_J;
+        NormalizeAndPrintAsWatts(otherStr, other_J);
+
+        char totalStr[kNumStrLen];
+        double total_J = pkg_J + ram_J;
+        NormalizeAndPrintAsWatts(totalStr, total_J);
+
+        PrintAndFlush("%d:%d:%d.%d,", pt->tm_hour,pt->tm_min,pt->tm_sec,cur_millisec);
+        for(int i = 0; i < EVENTS_NUM; i++) {
+            PrintAndFlush("%lld,",values[i]);
+        }
+        PrintAndFlush("%s,%s,%s,%s\n",coresStr,gpuStr,pkgStr,ramStr);
+
+        usleep(250000 * 4);
+        if(accu >= sampleCount)
+            break;
+        accu++;
+    }
     pthread_exit(NULL);// exit the thread
 }
 
+
+int
+main()
+{
+    /*
+     *   To free pagecache:
+     *      echo 1 > /proc/sys/vm/drop_caches
+     *   To free reclaimable slab objects (includes dentries and inodes):
+     *       echo 2 > /proc/sys/vm/drop_caches
+     *   To free slab objects and pagecache:
+     *       echo 3 > /proc/sys/vm/drop_caches
+     */
+    char string[] ="sync && echo 3 > /proc/sys/vm/drop_caches && sleep 2 \
+             && echo 1 > /proc/sys/vm/drop_caches \
+             && echo 2 > /proc/sys/vm/drop_caches";
+    system(string); //清除系统缓存
+
+    char filename[256];
+    itime = time(NULL);
+    pt = localtime(&itime);
+    sprintf(filename, "util-power-%d-%d.csv", pt->tm_hour, pt->tm_min);
+    if((fp = fopen(filename, "ab")) == NULL)
+    {
+        perror("file open failed!");
+        exit(EXIT_FAILURE);
+    }
+
+    int pth_result;
+    pthread_t a_thread;//用于获取组件利用率的单线程
+
+    //create a thread used to deal with the performance sample stuff
+    pth_result = pthread_create(&a_thread, NULL, thread_utility, NULL);
+    if(pth_result != 0) {
+        perror("thread creation failed");
+        exit(1);
+    }
+
+    /* Do some computation here */
+    int a = 0;
+    int b = 1;
+    for( int k = 0; k<1000000; k++)
+    {
+        for(int c =0; c < 1000; c++)
+        {
+            a = rand()%100;
+            a = a*34.6;
+        }
+        b = b+3;
+    }
+
+    pth_result = pthread_cancel(a_thread);
+    if(pth_result != 0)
+    {
+        perror("Thread cancellation failed!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    void *joinresult;
+    pth_result = pthread_join(a_thread,&joinresult);//等待回收其他线程，该函数会一直阻塞，直到被收回的线程结束为止
+    if(pth_result != 0)
+    {
+        exit(EXIT_FAILURE);
+    }
+    fclose(fp);
+    exit(EXIT_SUCCESS);
+}
 
 
 
