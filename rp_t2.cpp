@@ -16,20 +16,16 @@
 #include <ctype.h>
 #include <errno.h>
 
-
-#define HARDWARE_COUNTERS_NUM   11
-
 int sampleInterval_msec = 1000;
 int sampleCount = 10;
 
 static int select_preset_events[] = {PAPI_L1_DCM, PAPI_L1_ICM, PAPI_L2_DCM,
-                                               PAPI_L2_ICM, PAPI_L1_TCM, PAPI_L2_TCM
-                                              };
-
+                                     PAPI_L2_ICM, PAPI_L1_TCM, PAPI_L2_TCM
+                                    };
 static char *select_preset_events_name[] = {"PAPI_L1_DCM", "PAPI_L1_ICM", "PAPI_L2_DCM",
-                                                      "PAPI_L2_ICM", "PAPI_L1_TCM", "PAPI_L2_TCM"
-                                                     };
-                                                     
+                                            "PAPI_L2_ICM", "PAPI_L1_TCM", "PAPI_L2_TCM"
+                                           };
+
 static int  EVENTS_NUM = sizeof(select_preset_events)/sizeof(select_preset_events[0]);
 
 //char *select_native_events[EVENTS_NUM];
@@ -267,9 +263,32 @@ NormalizeAndPrintAsWatts(char* aBuf, double& aValue_J)
     }
 }
 
-void
-*thread_utility(void *arg)
+int
+main()
 {
+    /*
+     *   To free pagecache:
+     *      echo 1 > /proc/sys/vm/drop_caches
+     *   To free reclaimable slab objects (includes dentries and inodes):
+     *       echo 2 > /proc/sys/vm/drop_caches
+     *   To free slab objects and pagecache:
+     *       echo 3 > /proc/sys/vm/drop_caches
+     */
+    char string[] ="sync && echo 3 > /proc/sys/vm/drop_caches && sleep 2 \
+             && echo 1 > /proc/sys/vm/drop_caches \
+             && echo 2 > /proc/sys/vm/drop_caches";
+    system(string); //清除系统缓存
+
+    char filename[256];
+    itime = time(NULL);
+    pt = localtime(&itime);
+    sprintf(filename, "util-power-%d-%d.csv", pt->tm_hour, pt->tm_min);
+    if((fp = fopen(filename, "ab")) == NULL)
+    {
+        perror("file open failed!");
+        exit(EXIT_FAILURE);
+    }
+
 
     int retval, EventSet = PAPI_NULL;
     unsigned int native = 0x0;
@@ -325,28 +344,13 @@ void
     // Initialize the platform-specific RAPL reading machinery.
     gRapl = new RAPL();
 
-    int res;
-
-    res = pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-    if(res != 0) {
-        perror("Thread pthread_setcancelstate failed!");
-        exit(EXIT_FAILURE);
-    }
-
-    //PTHREAD_CANCEL_DEFERRED--接收到取消请求后，一直等待，直到线程执行一些函数
-    res = pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
-    if(res != 0) {
-        perror("Thread pthread_setcanceltype failed!");
-        exit(EXIT_FAILURE);
-    }
-
     PrintAndFlush("timestamp,");
     for (int i=0; i < EVENTS_NUM; i++) {
         PrintAndFlush("%s,",select_preset_events_name[i]);
     }
     PrintAndFlush("pp0-power,pp1-power,pkg-power,ram-power\n");
 
-    int accu = 1;
+    int accu = 0;
     while(true) {
 
         if (PAPI_reset(EventSet) != PAPI_OK) {
@@ -358,8 +362,7 @@ void
         pt = localtime(&itime);//将从1970－1-1零点零分到当前时间系统所偏移的秒数时间转换为本地时间
         int cur_millisec = tv.tv_usec/1000;
 
-
-        long_long values[EVENTS_NUM] = {0};
+        long_long values[128] = {0};
         /* Read counters */
         if (PAPI_read(EventSet, values) != PAPI_OK) {
             Abort("PAPI_read error! \n");
@@ -384,12 +387,6 @@ void
         NormalizeAndPrintAsWatts(gpuStr,   gpu_J);
         NormalizeAndPrintAsWatts(ramStr,   ram_J);
 
-        // Core and GPU power are a subset of the package power.
-//         assert(pkg_J >= cores_J + gpu_J);
-
-        // Compute "other" (i.e. rest of the package) and "total" only after the
-        // other values have been normalized.
-
         char otherStr[kNumStrLen];
         double other_J = pkg_J - cores_J - gpu_J;
         NormalizeAndPrintAsWatts(otherStr, other_J);
@@ -398,88 +395,36 @@ void
         double total_J = pkg_J + ram_J;
         NormalizeAndPrintAsWatts(totalStr, total_J);
 
-        PrintAndFlush("%d:%d:%d.%d,", pt->tm_hour,pt->tm_min,pt->tm_sec,cur_millisec);
-        for(int i = 0; i < EVENTS_NUM; i++) {
-            PrintAndFlush("%lld,",values[i]);
+        //fix the first power records all are 0
+        if (accu > 0) {
+            PrintAndFlush("%d:%d:%d.%d,", pt->tm_hour,pt->tm_min,pt->tm_sec,cur_millisec);
+            for(int i = 0; i < EVENTS_NUM; i++) {
+                PrintAndFlush("%lld,",values[i]);
+            }
+            PrintAndFlush("%s,%s,%s,%s\n",coresStr,gpuStr,pkgStr,ramStr);
         }
-        PrintAndFlush("%s,%s,%s,%s\n",coresStr,gpuStr,pkgStr,ramStr);
 
+        //+1s
         usleep(250000 * 4);
-        if(accu >= sampleCount)
+
+        if(accu >= sampleCount) {
+            if (PAPI_stop(EventSet, values) != PAPI_OK) {
+                Abort("PAPI_stop error \n");
+            }
+            if (PAPI_cleanup_eventset(EventSet) != PAPI_OK) {
+                Abort("PAPI_stop error \n");
+            }
+            if (PAPI_destroy_eventset(&EventSet) != PAPI_OK) {
+                Abort("PAPI_stop error \n");
+            }
             break;
-        accu++;
-    }
-    pthread_exit(NULL);// exit the thread
-}
-
-
-int
-main()
-{
-    /*
-     *   To free pagecache:
-     *      echo 1 > /proc/sys/vm/drop_caches
-     *   To free reclaimable slab objects (includes dentries and inodes):
-     *       echo 2 > /proc/sys/vm/drop_caches
-     *   To free slab objects and pagecache:
-     *       echo 3 > /proc/sys/vm/drop_caches
-     */
-    char string[] ="sync && echo 3 > /proc/sys/vm/drop_caches && sleep 2 \
-             && echo 1 > /proc/sys/vm/drop_caches \
-             && echo 2 > /proc/sys/vm/drop_caches";
-    system(string); //清除系统缓存
-
-    char filename[256];
-    itime = time(NULL);
-    pt = localtime(&itime);
-    sprintf(filename, "util-power-%d-%d.csv", pt->tm_hour, pt->tm_min);
-    if((fp = fopen(filename, "ab")) == NULL)
-    {
-        perror("file open failed!");
-        exit(EXIT_FAILURE);
-    }
-
-    int pth_result;
-    pthread_t a_thread;//用于获取组件利用率的单线程
-
-    //create a thread used to deal with the performance sample stuff
-    pth_result = pthread_create(&a_thread, NULL, thread_utility, NULL);
-    if(pth_result != 0) {
-        perror("thread creation failed");
-        exit(1);
-    }
-
-    /* Do some computation here */
-    int a = 0;
-    int b = 1;
-    for( int k = 0; k<1000000; k++)
-    {
-        for(int c =0; c < 1000; c++)
-        {
-            a = rand()%100;
-            a = a*34.6;
         }
-        b = b+3;
-    }
-
-    pth_result = pthread_cancel(a_thread);
-    if(pth_result != 0)
-    {
-        perror("Thread cancellation failed!\n");
-        exit(EXIT_FAILURE);
-    }
-
-    void *joinresult;
-    pth_result = pthread_join(a_thread,&joinresult);//等待回收其他线程，该函数会一直阻塞，直到被收回的线程结束为止
-    if(pth_result != 0)
-    {
-        exit(EXIT_FAILURE);
+        accu++;
     }
     fclose(fp);
     printf("finshed");
-    exit(EXIT_SUCCESS);
+    return 0;
 }
-
 
 
 
