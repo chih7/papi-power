@@ -16,21 +16,21 @@
 #include <ctype.h>
 #include <errno.h>
 
+
 #define HARDWARE_COUNTERS_NUM   11
-#define EVENTS_NUM              8
 
 int sampleInterval_msec = 1000;
 int sampleCount = 10;
 
-static int select_preset_events[EVENTS_NUM] = {PAPI_L1_DCM, PAPI_L1_ICM, PAPI_L2_DCM,
-                                               PAPI_L2_ICM, PAPI_L1_TCM, PAPI_L2_TCM,
-                                               PAPI_L3_TCM, PAPI_L3_LDM
+static int select_preset_events[] = {PAPI_L1_DCM, PAPI_L1_ICM, PAPI_L2_DCM,
+                                               PAPI_L2_ICM, PAPI_L1_TCM, PAPI_L2_TCM
                                               };
 
-static char *select_preset_events_name[EVENTS_NUM] = {"PAPI_L1_DCM", "PAPI_L1_ICM", "PAPI_L2_DCM",
-                                                      "PAPI_L2_ICM", "PAPI_L1_TCM", "PAPI_L2_TCM",
-                                                      "PAPI_L3_TCM", "PAPI_L3_LDM"
+static char *select_preset_events_name[] = {"PAPI_L1_DCM", "PAPI_L1_ICM", "PAPI_L2_DCM",
+                                                      "PAPI_L2_ICM", "PAPI_L1_TCM", "PAPI_L2_TCM"
                                                      };
+                                                     
+static int  EVENTS_NUM = sizeof(select_preset_events)/sizeof(select_preset_events[0]);
 
 //char *select_native_events[EVENTS_NUM];
 
@@ -66,11 +66,9 @@ PrintAndFlush(const char* aFormat, ...)
     va_list vargs;
     va_start(vargs, aFormat);
     vfprintf(fp, aFormat, vargs);
-    vfprintf(stdout, aFormat, vargs);
     va_end(vargs);
 
     fflush(fp);
-    fflush(stdout);
 }
 
 //---------------------------------------------------------------------------
@@ -278,15 +276,13 @@ void
 
     /* Initialize the PAPI library */
     if((PAPI_library_init(PAPI_VER_CURRENT)) != PAPI_VER_CURRENT ) {
-        printf("PAPI failed to init.\n");
-        exit(1);
+        Abort("PAPI failed to init.\n");
     }
 
     /* Create an EventSet */
     EventSet = PAPI_NULL;
     if (PAPI_create_eventset(&EventSet) != PAPI_OK) {
-        printf("PAPI failed to create the event set.\n");
-        exit(1);
+        Abort("PAPI failed to create the event set.\n");
     }
     //if (PAPI_set_multiplex(EventSet) != PAPI_OK){
     //	printf("PAPI multiplexing is not supported\n");
@@ -295,13 +291,16 @@ void
     //=========================================================
     for(int i = 0; i < EVENTS_NUM; i++) {
         if(PAPI_query_event(select_preset_events[i]) == PAPI_OK) {
-            PAPI_add_event(EventSet, select_preset_events[i]);
+            if(PAPI_add_event(EventSet, select_preset_events[i]) != PAPI_OK) {
+                Abort("PAPI_add_event %s error! \n", select_preset_events_name[i]);
+            }
+        } else {
+            Abort("PAPI_query_event %s error! \n", select_preset_events_name[i]);
         }
     }
 
     if (PAPI_start(EventSet) != PAPI_OK) {
-        printf("PAPI_start error! \n");
-        exit(1);
+        Abort("PAPI_start error! \n");
     }
 
     // The RAPL MSRs update every ~1 ms, but the measurement period isn't exactly
@@ -351,8 +350,7 @@ void
     while(true) {
 
         if (PAPI_reset(EventSet) != PAPI_OK) {
-            printf("PAPI_reset error! \n");
-            exit(1);
+            Abort("PAPI_reset error! \n");
         }
 
         gettimeofday (&tv, NULL);
@@ -364,8 +362,7 @@ void
         long_long values[EVENTS_NUM] = {0};
         /* Read counters */
         if (PAPI_read(EventSet, values) != PAPI_OK) {
-            printf("PAPI_read error! \n");
-            exit(1);
+            Abort("PAPI_read error! \n");
         }
 
         double pkg_J, cores_J, gpu_J, ram_J;
@@ -388,7 +385,7 @@ void
         NormalizeAndPrintAsWatts(ramStr,   ram_J);
 
         // Core and GPU power are a subset of the package power.
-        assert(pkg_J >= cores_J + gpu_J);
+//         assert(pkg_J >= cores_J + gpu_J);
 
         // Compute "other" (i.e. rest of the package) and "total" only after the
         // other values have been normalized.
@@ -479,17 +476,9 @@ main()
         exit(EXIT_FAILURE);
     }
     fclose(fp);
+    printf("finshed");
     exit(EXIT_SUCCESS);
 }
-
-
-
-
-
-
-
-
-
 
 
 
