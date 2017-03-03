@@ -16,7 +16,7 @@
 #include <ctype.h>
 #include <errno.h>
 
-int sampleInterval_msec = 1000;
+int sampleInterval_msec = 10000;
 int sampleCount = 10;
 
 const int MAX_ADD_EVENTS = 6;
@@ -149,8 +149,6 @@ static char *select_preset_events_name[] = {"PAPI_L1_DCM",
 
 
 static int  EVENTS_NUM = sizeof(select_preset_events)/sizeof(select_preset_events[0]);
-
-// static int EVENTS_NUM = 6;
 
 //char *select_native_events[EVENTS_NUM];
 
@@ -422,86 +420,26 @@ detect()
                 "inaccurate estimates\n\n");
     }
 
-    // Initialize the platform-specific RAPL reading machinery.
-    gRapl = new RAPL();
-
     //print the table head
     PrintAndFlush("timestamp,");
+    PrintAndFlush("pp0-power,pp1-power,pkg-power,ram-power,");
     for (int i=0; i < EVENTS_NUM; i++) {
         PrintAndFlush("%s,",select_preset_events_name[i]);
     }
-    PrintAndFlush("pp0-power,pp1-power,pkg-power,ram-power\n");
+    PrintAndFlush("\n");
 
     // ============================= table body ==================================
     int accu = 0;
     // every row
     while(true) {
 
-        printf("accu: %d\n", accu);
-
         gettimeofday (&tv, NULL);
         itime = time(NULL);//从1970年－1-1零点零分到当前系统所偏移的秒数
         pt = localtime(&itime);//将从1970－1-1零点零分到当前时间系统所偏移的秒数时间转换为本地时间
         int cur_millisec = tv.tv_usec/1000;
 
-        PrintAndFlush("%d:%d:%d.%d,", pt->tm_hour,pt->tm_min,pt->tm_sec,cur_millisec);
-
-        // time division multiplexing
-        int run = 0;
-        const int RUN_TIMES = (EVENTS_NUM - 1) / MAX_ADD_EVENTS + 1;//向上取整
-        printf("RUN_TIMES: %d\n", RUN_TIMES);
-        for(; run < RUN_TIMES; run++) {
-            printf("run: %d\n", run);
-
-            if (PAPI_cleanup_eventset(EventSet) != PAPI_OK) {
-                Abort("PAPI_stop error \n");
-            }
-
-            for(int i = 0; i < MAX_ADD_EVENTS; i++) {
-                printf("int: %d\n", i);
-                if(PAPI_query_event(select_preset_events[i + run * MAX_ADD_EVENTS]) == PAPI_OK) {
-                    retval = PAPI_add_event(EventSet, select_preset_events[i + run * MAX_ADD_EVENTS]);
-                    if(retval != PAPI_OK) {
-                        Abort("PAPI_add_event %s error : %d! \n",
-                              select_preset_events_name[i + run * MAX_ADD_EVENTS], retval);
-                    }
-                } else {
-                    Abort("PAPI_query_event %s error! \n",
-                          select_preset_events_name[i + run * MAX_ADD_EVENTS]);
-                }
-            }
-
-            if (PAPI_reset(EventSet) != PAPI_OK) {
-                Abort("PAPI_reset error! \n");
-            }
-
-            if (PAPI_start(EventSet) != PAPI_OK) {
-                Abort("PAPI_start error! \n");
-            }
-
-            // impossible exceed 128
-            long_long values[128] = {0};
-            /* Read counters */
-            if (PAPI_read(EventSet, values) != PAPI_OK) {
-                Abort("PAPI_read error! \n");
-            }
-
-            for(int i = 0; i < MAX_ADD_EVENTS; i++) {
-                // is values need to * RUN_TIMES
-                PrintAndFlush("%lld,",values[i]);
-            }
-
-            usleep(sampleInterval_msec * 1000 / RUN_TIMES);
-
-            if (PAPI_stop(EventSet, values) != PAPI_OK) {
-                Abort("PAPI_stop error \n");
-            }
-            if (PAPI_cleanup_eventset(EventSet) != PAPI_OK) {
-                Abort("PAPI_stop error \n");
-            }
-
-        } // end multiplexing
-
+        // Initialize the platform-specific RAPL reading machinery.
+        gRapl = new RAPL();
         double pkg_J, cores_J, gpu_J, ram_J;
         gRapl->EnergyEstimates(pkg_J, cores_J, gpu_J, ram_J);
 
@@ -528,12 +466,65 @@ detect()
         char totalStr[kNumStrLen];
         double total_J = pkg_J + ram_J;
         NormalizeAndPrintAsWatts(totalStr, total_J);
-        PrintAndFlush("%s,%s,%s,%s\n",coresStr,gpuStr,pkgStr,ramStr);
+
+        PrintAndFlush("%d:%d:%d.%d,", pt->tm_hour,pt->tm_min,pt->tm_sec,cur_millisec);
+        PrintAndFlush("%s,%s,%s,%s,",coresStr,gpuStr,pkgStr,ramStr);
+
+        // time division multiplexing
+        int run = 0;
+        const int RUN_TIMES = (EVENTS_NUM - 1) / MAX_ADD_EVENTS + 1;//向上取整
+        for(; run < RUN_TIMES; run++) {
+            for(int i = 0; i < MAX_ADD_EVENTS; i++) {
+                if(PAPI_query_event(select_preset_events[i + run * MAX_ADD_EVENTS]) == PAPI_OK) {
+                    printf("No: %d\n", i + run * MAX_ADD_EVENTS);
+                    retval = PAPI_add_event(EventSet, select_preset_events[i + run * MAX_ADD_EVENTS]);
+                    if(retval != PAPI_OK) {
+                        printf("PAPI_add_event %s error : %d! \n",
+                               select_preset_events_name[i + run * MAX_ADD_EVENTS], retval);
+                    }
+                } else {
+                    printf("PAPI_query_event %s error! \n",
+                           select_preset_events_name[i + run * MAX_ADD_EVENTS]);
+                }
+            }
+
+            if (PAPI_reset(EventSet) != PAPI_OK) {
+                Abort("PAPI_reset error! \n");
+            }
+
+            if (PAPI_start(EventSet) != PAPI_OK) {
+                Abort("PAPI_start error! \n");
+            }
+
+            // impossible exceed 128
+            long_long values[128] = {0};
+            /* Read counters */
+            if (PAPI_read(EventSet, values) != PAPI_OK) {
+                Abort("PAPI_read error! \n");
+            }
+
+            for(int i = 0; i < MAX_ADD_EVENTS; i++) {
+                // is values need to * RUN_TIMES
+                PrintAndFlush("%lld,",values[i]);
+            }
+
+            if (PAPI_stop(EventSet, values) != PAPI_OK) {
+                Abort("PAPI_stop error \n");
+            }
+            if (PAPI_cleanup_eventset(EventSet) != PAPI_OK) {
+                Abort("PAPI_stop error \n");
+            }
+
+            usleep(sampleInterval_msec * 1000 / RUN_TIMES);
+        } // end multiplexing
+
+        PrintAndFlush("\n");
 
         if(accu >= sampleCount) {
             if (PAPI_destroy_eventset(&EventSet) != PAPI_OK) {
                 Abort("PAPI_stop error \n");
             }
+            PAPI_shutdown();
 
             break;
         }
@@ -723,6 +714,7 @@ main()
     printf("finshed");
     return 0;
 }
+
 
 
 
