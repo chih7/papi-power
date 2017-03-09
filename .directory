@@ -1,4 +1,7 @@
 [Dolphin]
 SortRole=date
-Timestamp=2017,3,3,13,24,14
+Timestamp=2017,3,9,21,33,35
 Version=3
+
+[Settings]
+HiddenFilesShown=true

@@ -35,8 +35,6 @@
 *.i*86
 *.x86_64
 *.hex
-rp_t
-rp-t2
 
 # Debug files
 *.dSYM/
@@ -51,6 +49,3 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
-
-csv/
-*.csv
